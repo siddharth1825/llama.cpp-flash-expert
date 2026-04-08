@@ -3,7 +3,6 @@
 
 #include "llama-remote-expert-client.h"
 #include "llama-remote-expert.h"
-#include "llama.h"
 
 #include <cstdio>
 #include <cstring>
@@ -181,12 +180,4 @@ void llama_remote_expert_disconnect() {
     remote_expert_disconnect_impl();
 }
 
-// C API wrappers (declared in llama.h)
-
-bool llama_remote_expert_init(const char * addr) {
-    return remote_expert_connect_impl(std::string(addr));
-}
-
-void llama_remote_expert_free(void) {
-    remote_expert_disconnect_impl();
-}
+// C API wrappers removed — use C++ API directly.

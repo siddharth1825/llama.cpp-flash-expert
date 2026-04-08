@@ -1,5 +1,5 @@
-#include "llama-model-loader.h"
 #include "llama-remote-expert.h"
+#include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -37,6 +37,7 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_ALL_F32:         return "all F32";
         case LLAMA_FTYPE_MOSTLY_F16:      return "F16";
         case LLAMA_FTYPE_MOSTLY_BF16:     return "BF16";
+        case LLAMA_FTYPE_MOSTLY_Q1_0:     return "Q1_0";
         case LLAMA_FTYPE_MOSTLY_Q4_0:     return "Q4_0";
         case LLAMA_FTYPE_MOSTLY_Q4_1:     return "Q4_1";
         case LLAMA_FTYPE_MOSTLY_Q5_0:     return "Q5_0";
@@ -375,8 +376,9 @@ namespace GGUFMeta {
             }
         } else {
             if (arr_info.gt == GGUF_TYPE_BOOL) {
-                std::transform((const bool *)arr_info.data, (const bool *)arr_info.data + arr_info.length, result.begin(), [](bool x) {
-                    return static_cast<T>(x);
+                const int8_t * values = (const int8_t *) arr_info.data;
+                std::transform(values, values + arr_info.length, result.begin(), [](int8_t x) {
+                    return static_cast<T>(x != 0);
                 });
             } else {
                 std::copy((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length, result.begin());
@@ -758,6 +760,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
+            case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -1096,8 +1099,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             throw std::runtime_error(format("missing tensor info mapping for %s", tn.str().c_str()));
         }
 
-        // skip expert tensors when remote expert hook is active
-        // (they will be computed remotely, no need to load ~14GB of weights)
+        // skip expert tensors when remote/flash expert hook is active
         {
             auto * hook = llama_get_remote_expert_hook();
             if (hook && hook->enabled) {
@@ -1109,8 +1111,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     case LLM_TENSOR_FFN_DOWN_SHEXP:
                     case LLM_TENSOR_FFN_GATE_SHEXP:
                     case LLM_TENSOR_FFN_UP_SHEXP:
-                    case LLM_TENSOR_FFN_GATE_INP_SHEXP:
-                    {
+                    case LLM_TENSOR_FFN_GATE_INP_SHEXP: {
                         const size_t nbytes = ggml_nbytes(t_meta);
                         LLAMA_LOG_INFO("remote expert: skipping tensor %s (%.1f MiB)\n",
                             tn.str().c_str(), nbytes / (1024.0 * 1024.0));
@@ -1118,8 +1119,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         n_created++;
                         return nullptr;
                     }
-                    default:
-                        break;
+                    default: break;
                 }
             }
         }

@@ -154,6 +154,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_TQ2_0         = 37, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -645,45 +646,6 @@ extern "C" {
             const char * fname_inp,
             const char * fname_out,
             const llama_model_quantize_params * params);
-
-    //
-    // Remote expert hook (for distributed MoE inference)
-    //
-
-    // C-compatible callback for remote expert computation.
-    // See llama-remote-expert.h for the full C++ API with std::function.
-    //
-    // hidden:  [n_embd * n_tokens] float array (input hidden states)
-    // indices: [n_expert_used * n_tokens] int32 array (selected expert indices)
-    // weights: [n_expert_used * n_tokens] float array (routing weights)
-    // output:  [n_embd * n_tokens] float array (pre-allocated, write result here)
-    // Returns true on success.
-    typedef bool (*llama_remote_expert_cb)(
-            const float * hidden,
-            int64_t       n_embd,
-            int64_t       n_tokens,
-            const int32_t * indices,
-            const float * weights,
-            int64_t       n_expert_used,
-            int           layer,
-            float *       output,
-            void *        userdata);
-
-    // Set the remote expert hook. When set, MoE expert FFN computation
-    // is redirected to the callback instead of being computed locally.
-    LLAMA_API void llama_set_remote_expert_callback(llama_remote_expert_cb cb, void * userdata);
-
-    // Clear the remote expert hook (revert to local computation).
-    LLAMA_API void llama_clear_remote_expert_callback(void);
-
-    // Connect to a remote expert worker (TCP).
-    // addr: "host:port" (e.g., "192.168.1.100:50100")
-    // Returns true on success. Automatically installs the hook.
-    // C++ users: prefer llama_remote_expert_connect() from llama-remote-expert-client.h
-    LLAMA_API bool llama_remote_expert_init(const char * addr);
-
-    // Disconnect from the remote expert worker and clear the hook.
-    LLAMA_API void llama_remote_expert_free(void);
 
     //
     // Adapters

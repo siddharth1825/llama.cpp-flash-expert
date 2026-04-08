@@ -109,14 +109,10 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     // Flash-expert: SSD streaming for MoE expert weights
-    // LLAMA_FLASH_EXPERT=<repacked experts dir>
-    // LLAMA_PIN_EXPERTS=1,9,50,80,8,140,0,13,237,55 (optional, hot expert indices)
     {
         const char * flash_expert = std::getenv("LLAMA_FLASH_EXPERT");
         if (flash_expert && flash_expert[0]) {
             LOG_INF("initializing flash-expert from: %s\n", flash_expert);
-
-            // Parse pinned expert list
             std::vector<int> pin_experts;
             const char * pin_str = std::getenv("LLAMA_PIN_EXPERTS");
             if (pin_str && pin_str[0]) {
@@ -131,7 +127,6 @@ int main(int argc, char ** argv) {
                 }
                 LOG_INF("pinning %zu hot experts in RAM\n", pin_experts.size());
             }
-
             extern bool llama_flash_expert_init(const std::string & experts_dir, const std::vector<int> & pin_experts);
             if (!llama_flash_expert_init(std::string(flash_expert), pin_experts)) {
                 LOG_ERR("failed to initialize flash-expert: %s\n", flash_expert);
@@ -140,24 +135,8 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Connect to remote expert worker if LLAMA_REMOTE_EXPERT env var is set
-    // Format: "host:port" (e.g., "192.168.1.100:50100")
-    {
-        const char * remote_expert = std::getenv("LLAMA_REMOTE_EXPERT");
-        if (remote_expert && remote_expert[0]) {
-            LOG_INF("connecting to remote expert worker: %s\n", remote_expert);
-            if (!llama_remote_expert_init(remote_expert)) {
-                LOG_ERR("failed to connect to remote expert worker: %s\n", remote_expert);
-                return 1;
-            }
-            LOG_INF("remote expert hook installed — MoE experts will be computed remotely\n");
-        }
-    }
-
-    LOG_INF("system info: n_threads = %d, n_threads_batch = %d, total_threads = %d\n", params.cpuparams.n_threads, params.cpuparams_batch.n_threads, std::thread::hardware_concurrency());
-    LOG_INF("\n");
+    LOG_INF("build_info: %s\n", build_info.c_str());
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
-    LOG_INF("\n");
 
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {

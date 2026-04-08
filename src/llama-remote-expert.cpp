@@ -1,5 +1,4 @@
 #include "llama-remote-expert.h"
-#include "llama.h"
 #include "ggml.h"
 
 #include <cstring>
@@ -72,29 +71,4 @@ void llama_remote_expert_custom_op(
     }
 }
 
-// ── C API wrappers (exposed in llama.h) ────────────────────────────
-
-// Storage for the C callback's userdata pointer
-static void * g_c_callback_userdata = nullptr;
-static llama_remote_expert_cb g_c_callback = nullptr;
-
-void llama_set_remote_expert_callback(llama_remote_expert_cb cb, void * userdata) {
-    g_c_callback = cb;
-    g_c_callback_userdata = userdata;
-
-    // Wrap the C callback in a std::function for the internal hook
-    llama_set_remote_expert_hook(
-        [](const float * hidden, int64_t n_embd, int64_t n_tokens,
-           const int32_t * indices, const float * weights, int64_t n_expert_used,
-           int layer, float * output) -> bool {
-            if (!g_c_callback) return false;
-            return g_c_callback(hidden, n_embd, n_tokens, indices, weights,
-                                n_expert_used, layer, output, g_c_callback_userdata);
-        });
-}
-
-void llama_clear_remote_expert_callback(void) {
-    g_c_callback = nullptr;
-    g_c_callback_userdata = nullptr;
-    llama_clear_remote_expert_hook();
-}
+// C API wrappers removed — use C++ API (llama-remote-expert.h) directly.

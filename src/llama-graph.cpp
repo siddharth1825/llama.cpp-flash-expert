@@ -1,5 +1,5 @@
-#include "llama-graph.h"
 #include "llama-remote-expert.h"
+#include "llama-graph.h"
 
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -1403,48 +1403,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // ── Remote expert hook ──────────────────────────────────────────
-    // If a remote expert hook is registered, replace the entire expert FFN
-    // subgraph with a single custom op that does a gRPC call.
+    // ── Remote/flash expert hook ────────────────────────────────
     {
         auto * hook = llama_get_remote_expert_hook();
         if (hook && hook->enabled) {
-            // Prepare inputs for the custom op:
-            //   a = cur (hidden states) [n_embd, n_tokens] F32
-            //   b = selected_experts    [n_expert_used, n_tokens] I32
-            //   c = weights             [n_expert_used, n_tokens] F32 (reshaped from 3D)
-            ggml_tensor * hook_cur = ggml_cont(ctx0, cur); // ensure contiguous [n_embd, n_tokens]
+            ggml_tensor * hook_cur = ggml_cont(ctx0, cur);
             cb(hook_cur, "ffn_moe_remote_input", il);
-
-            ggml_tensor * hook_indices = ggml_cont(ctx0, selected_experts); // [n_expert_used, n_tokens]
+            ggml_tensor * hook_indices = ggml_cont(ctx0, selected_experts);
             cb(hook_indices, "ffn_moe_remote_indices", il);
-
-            ggml_tensor * hook_weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens); // [n_expert_used, n_tokens]
+            ggml_tensor * hook_weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
             hook_weights = ggml_cont(ctx0, hook_weights);
             cb(hook_weights, "ffn_moe_remote_weights", il);
-
-            // Layer index passed via userdata (intentionally leaked — one per layer, persists for model lifetime)
             int * layer_ptr = new int(il);
-
-            // The custom op produces [n_embd, n_tokens] — the combined expert + shared expert output.
-            // The remote worker handles: expert FFN + shared expert FFN + combination.
             ggml_tensor * moe_out = ggml_map_custom3(ctx0,
                 hook_cur, hook_indices, hook_weights,
-                llama_remote_expert_custom_op,
-                1, // n_tasks = 1 (single-threaded, it's a network call)
-                layer_ptr);
-
-            // Set output shape to match expected [n_embd, n_tokens]
+                llama_remote_expert_custom_op, 1, layer_ptr);
             moe_out->ne[0] = n_embd;
             moe_out->ne[1] = n_tokens;
             moe_out->ne[2] = 1;
             moe_out->ne[3] = 1;
-
             cb(moe_out, "ffn_moe_out", il);
             return moe_out;
         }
     }
-    // ── End remote expert hook ──────────────────────────────────────
+    // ── End hook ────────────────────────────────────────────────
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
