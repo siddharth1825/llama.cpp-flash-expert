@@ -130,6 +130,35 @@ kernel void dequant_matvec(
     out[tid]=sum;
 }
 
+// SIMD-tiled: 32 threads per row, split blocks, simd_sum reduction
+kernel void dequant_matvec_simd(
+    device const uint8_t * W [[buffer(0)]],
+    device const float   * x [[buffer(1)]],
+    device float         * out [[buffer(2)]],
+    constant uint        * params [[buffer(3)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]]
+) {
+    uint out_dim=params[0], in_dim=params[1], type_id=params[2];
+    uint row=gid;
+    if (row>=out_dim) return;
+    uint bs=blk_bytes(type_id), nb=in_dim/QK_K, rb=nb*bs;
+    device const uint8_t*row_data=W+row*rb;
+    float partial=0;
+    for (uint b=lid; b<nb; b+=32) {
+        device const uint8_t*blk=row_data+b*bs;
+        switch(type_id){
+            case TYPE_Q3K:partial+=q3k_block_dot(blk,x,b*QK_K);break;
+            case TYPE_Q4K:partial+=q4k_block_dot(blk,x,b*QK_K);break;
+            case TYPE_Q5K:partial+=q5k_block_dot(blk,x,b*QK_K);break;
+            default:break;
+        }
+    }
+    partial=simd_sum(partial);
+    if (simd_lane==0) out[row]=partial;
+}
+
 kernel void swiglu_fused(
     device float*gate[[buffer(0)]],device const float*up[[buffer(1)]],
     constant uint*params[[buffer(2)]],uint tid[[thread_position_in_grid]]
