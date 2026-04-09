@@ -36,6 +36,9 @@ void ggml_metal_set_abort_callback  (ggml_metal_t ctx, ggml_abort_callback abort
 bool ggml_metal_supports_family     (ggml_metal_t ctx, int family);
 void ggml_metal_capture_next_compute(ggml_metal_t ctx);
 
+// Get the Metal command queue (as void* to avoid ObjC types in C header)
+void * ggml_metal_get_queue(ggml_metal_t ctx);
+
 #ifdef __cplusplus
 }
 #endif

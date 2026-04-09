@@ -56,6 +56,12 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+// Get the Metal command queue (id<MTLCommandQueue>) from a Metal backend.
+// Returns NULL if the backend is not Metal.
+// Used by flash-expert to submit expert compute to the same GPU queue
+// as the main GGML graph execution, enabling pipeline parallelism.
+GGML_BACKEND_API void * ggml_backend_metal_get_queue(ggml_backend_t backend);
+
 #ifdef __cplusplus
 }
 #endif

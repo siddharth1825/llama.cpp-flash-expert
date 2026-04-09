@@ -13,7 +13,8 @@
 // ── Persistent Metal state ─────────────────────────────────────────
 
 static id<MTLDevice>              g_device;
-static id<MTLCommandQueue>        g_queue;
+static id<MTLCommandQueue>        g_queue;        // our own queue
+static id<MTLCommandQueue>        g_ggml_queue;   // GGML's queue (for pipeline mode)
 static id<MTLComputePipelineState> g_matvec_pipeline;
 static id<MTLComputePipelineState> g_swiglu_pipeline;
 static id<MTLComputePipelineState> g_weighted_add_pipeline;
@@ -215,7 +216,8 @@ bool flash_expert_metal_compute(
         uint32_t up_tid   = ggml_type_to_shader_id(up_type);
         uint32_t down_tid = ggml_type_to_shader_id(down_type);
 
-        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLCommandQueue> active_queue = g_ggml_queue ? g_ggml_queue : g_queue;
+        id<MTLCommandBuffer> cmd = [active_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
         // 1. gate_out = gate_w @ x  [n_ff]
@@ -284,7 +286,8 @@ bool flash_expert_metal_compute_shared(
         uint32_t up_tid   = ggml_type_to_shader_id(up_type);
         uint32_t down_tid = ggml_type_to_shader_id(down_type);
 
-        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLCommandQueue> active_queue = g_ggml_queue ? g_ggml_queue : g_queue;
+        id<MTLCommandBuffer> cmd = [active_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
         dispatch_matvec(enc, g_buf_expert, gate_offset, g_buf_x, g_buf_gate_out,
@@ -337,7 +340,8 @@ bool flash_expert_metal_compute_batch(
         memcpy([g_buf_x contents], x, n_embd * sizeof(float));
         memset([g_buf_out contents], 0, n_embd * sizeof(float));
 
-        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLCommandQueue> active_queue = g_ggml_queue ? g_ggml_queue : g_queue;
+        id<MTLCommandBuffer> cmd = [active_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
         // Phase 1: Copy ALL expert data into distinct regions of the Metal buffer (CPU side)
@@ -497,6 +501,13 @@ bool flash_expert_metal_wait_deferred(float * out) {
 
     memcpy(out, [g_buf_out contents], g_deferred_n_embd * sizeof(float));
     return true;
+}
+
+void flash_expert_metal_set_ggml_queue(void * queue) {
+    g_ggml_queue = (__bridge id<MTLCommandQueue>)queue;
+    if (g_ggml_queue) {
+        fprintf(stderr, "[flash-expert-metal] Using GGML's Metal queue for pipeline parallelism\n");
+    }
 }
 
 void flash_expert_metal_free() {

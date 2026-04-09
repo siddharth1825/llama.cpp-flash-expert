@@ -632,6 +632,12 @@ void ggml_backend_metal_capture_next_compute(ggml_backend_t backend) {
     ggml_metal_capture_next_compute(ctx);
 }
 
+void * ggml_backend_metal_get_queue(ggml_backend_t backend) {
+    if (!ggml_backend_is_metal(backend)) return NULL;
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+    return ggml_metal_get_queue(ctx);
+}
+
 // backend device
 
 static const char * ggml_backend_metal_device_get_name(ggml_backend_dev_t dev) {

@@ -72,4 +72,10 @@ bool flash_expert_metal_compute_batch_deferred(
 
 bool flash_expert_metal_wait_deferred(float * out);
 
+// Set GGML's Metal command queue for pipeline parallelism.
+// When set, expert Metal commands are submitted to GGML's queue instead
+// of our own. This eliminates the CPU sync between attention and expert FFN.
+// Call this after llama_context is created (which creates the Metal backend).
+void flash_expert_metal_set_ggml_queue(void * queue);
+
 void flash_expert_metal_free();

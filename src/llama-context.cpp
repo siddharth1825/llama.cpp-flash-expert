@@ -1,6 +1,9 @@
 #include "llama-context.h"
 
 #include "llama-arch.h"
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -3066,6 +3069,23 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+void * llama_get_metal_queue(llama_context * ctx) {
+#ifdef GGML_USE_METAL
+    auto * sched = ctx->get_sched();
+    if (!sched) return nullptr;
+    int n = ggml_backend_sched_get_n_backends(sched);
+    for (int i = 0; i < n; i++) {
+        auto * backend = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_is_metal(backend)) {
+            return ggml_backend_metal_get_queue(backend);
+        }
+    }
+#else
+    (void)ctx;
+#endif
+    return nullptr;
 }
 
 float * llama_get_logits(llama_context * ctx) {

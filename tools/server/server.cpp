@@ -316,6 +316,14 @@ int main(int argc, char ** argv) {
 
         LOG_INF("%s: model loaded\n", __func__);
 
+        // Wire flash-expert to GGML's Metal queue for pipeline parallelism.
+        // Expert Metal commands on the same queue as GGML = no CPU sync points.
+        {
+            extern void flash_expert_metal_set_ggml_queue(void * queue);
+            void * queue = llama_get_metal_queue(ctx_server.get_llama_context());
+            if (queue) flash_expert_metal_set_ggml_queue(queue);
+        }
+
         shutdown_handler = [&](int) {
             // this will unblock start_loop()
             ctx_server.terminate();

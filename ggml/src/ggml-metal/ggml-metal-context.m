@@ -737,3 +737,7 @@ bool ggml_metal_supports_family(ggml_metal_t ctx, int family) {
 void ggml_metal_capture_next_compute(ggml_metal_t ctx) {
     ctx->capture_compute = 1;
 }
+
+void * ggml_metal_get_queue(ggml_metal_t ctx) {
+    return (__bridge void *)ggml_metal_device_get_queue(ctx->dev);
+}
