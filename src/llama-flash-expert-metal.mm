@@ -216,6 +216,9 @@ bool flash_expert_metal_compute(
         uint32_t up_tid   = ggml_type_to_shader_id(up_type);
         uint32_t down_tid = ggml_type_to_shader_id(down_type);
 
+        // Use GGML's queue when available (shared queue reduces context switching)
+        // This is safe because our callback runs from the CPU backend split,
+        // not from Metal's encode thread.
         id<MTLCommandQueue> active_queue = g_ggml_queue ? g_ggml_queue : g_queue;
         id<MTLCommandBuffer> cmd = [active_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -286,6 +289,9 @@ bool flash_expert_metal_compute_shared(
         uint32_t up_tid   = ggml_type_to_shader_id(up_type);
         uint32_t down_tid = ggml_type_to_shader_id(down_type);
 
+        // Use GGML's queue when available (shared queue reduces context switching)
+        // This is safe because our callback runs from the CPU backend split,
+        // not from Metal's encode thread.
         id<MTLCommandQueue> active_queue = g_ggml_queue ? g_ggml_queue : g_queue;
         id<MTLCommandBuffer> cmd = [active_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
@@ -340,6 +346,9 @@ bool flash_expert_metal_compute_batch(
         memcpy([g_buf_x contents], x, n_embd * sizeof(float));
         memset([g_buf_out contents], 0, n_embd * sizeof(float));
 
+        // Use GGML's queue when available (shared queue reduces context switching)
+        // This is safe because our callback runs from the CPU backend split,
+        // not from Metal's encode thread.
         id<MTLCommandQueue> active_queue = g_ggml_queue ? g_ggml_queue : g_queue;
         id<MTLCommandBuffer> cmd = [active_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];

@@ -1256,6 +1256,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             return has_simdgroup_reduction;
+        // MAP_CUSTOM3: stays on CPU backend (expert compute needs synced input data)
         default:
             return false;
     }

@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "llama-arch.h"
+#include "llama-remote-expert.h"
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
 #endif
@@ -2182,7 +2183,6 @@ ggml_status llama_context::graph_compute(
         }
     }
 
-    // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
@@ -2191,8 +2191,6 @@ ggml_status llama_context::graph_compute(
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
-
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
 }
