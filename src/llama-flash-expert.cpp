@@ -339,14 +339,14 @@ static bool flash_expert_callback(
                 entries[n_entries++] = e;
             }
 
-            // Batch routed experts only (one Metal commit instead of K)
+            // Batch routed experts (one Metal commit)
             flash_expert_metal_compute_batch(
                 entries, n_entries,
-                nullptr, nullptr,  // shared expert handled separately below
+                nullptr, nullptr,
                 x, out, n_embd, n_ff);
         }
 
-        // Shared expert FFN — separate call with sigmoid gate (cached in RAM)
+        // Shared expert FFN (cached in RAM, separate Metal commit for sigmoid gate)
         if (li.shared_bytes > 0 && s.n_shared_tensors >= 3 &&
             s.shared_cached && !s.shared_cache[layer].empty()) {
             const uint8_t * shared_data = s.shared_cache[layer].data();

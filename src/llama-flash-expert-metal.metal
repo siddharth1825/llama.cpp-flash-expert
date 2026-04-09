@@ -73,9 +73,20 @@ inline float q4k_block_dot(device const uint8_t * bp, device const float * x, ui
     for (uint j=0;j<QK_K;j+=64) {
         uint8_t s1,m1,s2,m2;
         get_scale_min_k4(is,sc,s1,m1); get_scale_min_k4(is+1,sc,s2,m2);
-        float d1=d*float(s1),m1f=mn*float(m1),d2=d*float(s2),m2f=mn*float(m2);
-        for(uint l=0;l<32;l++) sum+=(d1*float(ql[l]&0xF)-m1f)*x[xo+j+l];
-        for(uint l=0;l<32;l++) sum+=(d2*float(ql[l]>>4)-m2f)*x[xo+j+32+l];
+        float d1=d*float(s1),d2=d*float(s2);
+        float neg_m1=mn*float(m1), neg_m2=mn*float(m2);
+        float qx1=0, qx2=0, xs1=0, xs2=0;
+        for(uint l=0;l<32;l++) {
+            float xv=x[xo+j+l];
+            qx1+=float(ql[l]&0xF)*xv;
+            xs1+=xv;
+        }
+        for(uint l=0;l<32;l++) {
+            float xv=x[xo+j+32+l];
+            qx2+=float(ql[l]>>4)*xv;
+            xs2+=xv;
+        }
+        sum += fma(d1, qx1, -neg_m1*xs1) + fma(d2, qx2, -neg_m2*xs2);
         ql+=32; is+=2;
     }
     return sum;
@@ -91,9 +102,21 @@ inline float q5k_block_dot(device const uint8_t * bp, device const float * x, ui
     for (uint j=0;j<QK_K;j+=64) {
         uint8_t s1,m1,s2,m2;
         get_scale_min_k4(is,sc,s1,m1); get_scale_min_k4(is+1,sc,s2,m2);
-        float d1=d*float(s1),m1f=mn*float(m1),d2=d*float(s2),m2f=mn*float(m2);
-        for(uint l=0;l<32;l++) sum+=(d1*float((ql[l]&0xF)+((qh[l]&u1)?16:0))-m1f)*x[xo+j+l];
-        for(uint l=0;l<32;l++) sum+=(d2*float((ql[l]>>4)+((qh[l]&u2)?16:0))-m2f)*x[xo+j+32+l];
+        float d1=d*float(s1),d2=d*float(s2);
+        float neg_m1=mn*float(m1), neg_m2=mn*float(m2);
+        // FMA-style: separate q*d*x from min*x, avoid per-element subtract
+        float qx1=0, qx2=0, xs1=0, xs2=0;
+        for(uint l=0;l<32;l++) {
+            float xv=x[xo+j+l];
+            qx1+=float((ql[l]&0xF)+((qh[l]&u1)?16:0))*xv;
+            xs1+=xv;
+        }
+        for(uint l=0;l<32;l++) {
+            float xv=x[xo+j+32+l];
+            qx2+=float((ql[l]>>4)+((qh[l]&u2)?16:0))*xv;
+            xs2+=xv;
+        }
+        sum += fma(d1, qx1, -neg_m1*xs1) + fma(d2, qx2, -neg_m2*xs2);
         ql+=32; is+=2; u1<<=2; u2<<=2;
     }
     return sum;

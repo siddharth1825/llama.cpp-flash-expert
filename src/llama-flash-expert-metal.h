@@ -63,4 +63,13 @@ bool flash_expert_metal_compute_batch(
     int64_t n_embd,
     int64_t n_ff);
 
+// Deferred batch: commit without waiting, overlap with next layer's IO.
+// Call flash_expert_metal_wait_deferred() before reading result.
+bool flash_expert_metal_compute_batch_deferred(
+    const FlashExpertEntry * experts, int n_experts,
+    const float * x, float * out,
+    int64_t n_embd, int64_t n_ff);
+
+bool flash_expert_metal_wait_deferred(float * out);
+
 void flash_expert_metal_free();

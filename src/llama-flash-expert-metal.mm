@@ -412,15 +412,91 @@ bool flash_expert_metal_compute_batch(
         [cmd commit];
         [cmd waitUntilCompleted];
 
-        // Copy accumulated result back
-        // If shared expert has sigmoid gate, apply it to the shared portion
-        // But since we accumulated everything into g_buf_out, we can't separate
-        // shared from routed. For simplicity, apply gate on CPU before calling this.
-        // Actually the shared expert gate should be applied BEFORE adding to output.
-        // TODO: handle this properly. For now, gate_inp is applied in the caller.
         memcpy(out, [g_buf_out contents], n_embd * sizeof(float));
     }
 
+    return true;
+}
+
+// ── Deferred batch: commit without wait, overlap with next layer's IO ──
+
+static id<MTLCommandBuffer> g_deferred_cmd = nil;
+static int64_t g_deferred_n_embd = 0;
+
+bool flash_expert_metal_compute_batch_deferred(
+        const FlashExpertEntry * experts, int n_experts,
+        const float * x,
+        float * out,
+        int64_t n_embd,
+        int64_t n_ff) {
+
+    if (!g_initialized) return false;
+
+    // Wait for previous deferred command if any
+    if (g_deferred_cmd) {
+        [g_deferred_cmd waitUntilCompleted];
+        g_deferred_cmd = nil;
+    }
+
+    @autoreleasepool {
+        memcpy([g_buf_x contents], x, n_embd * sizeof(float));
+        memset([g_buf_out contents], 0, n_embd * sizeof(float));
+
+        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        int64_t slot_size = g_max_expert_bytes;
+        for (int e = 0; e < n_experts; e++) {
+            int64_t total = experts[e].down_offset + experts[e].down_bytes;
+            memcpy((uint8_t *)[g_buf_expert contents] + e * slot_size, experts[e].data, total);
+        }
+
+        for (int e = 0; e < n_experts; e++) {
+            const auto & exp = experts[e];
+            uint64_t base = (uint64_t)e * slot_size;
+            uint32_t gate_tid = ggml_type_to_shader_id(exp.gate_type);
+            uint32_t up_tid   = ggml_type_to_shader_id(exp.up_type);
+            uint32_t down_tid = ggml_type_to_shader_id(exp.down_type);
+
+            dispatch_matvec(enc, g_buf_expert, base + exp.gate_offset, g_buf_x, g_buf_gate_out,
+                            (uint32_t)n_ff, (uint32_t)n_embd, gate_tid);
+            dispatch_matvec(enc, g_buf_expert, base + exp.up_offset, g_buf_x, g_buf_up_out,
+                            (uint32_t)n_ff, (uint32_t)n_embd, up_tid);
+            dispatch_swiglu(enc, g_buf_gate_out, g_buf_up_out, (uint32_t)n_ff);
+            dispatch_matvec(enc, g_buf_expert, base + exp.down_offset, g_buf_gate_out, g_buf_down_out,
+                            (uint32_t)n_embd, (uint32_t)n_ff, down_tid);
+
+            float w = exp.weight;
+            uint32_t wadd_p[1] = { (uint32_t)n_embd };
+            [enc setComputePipelineState:g_weighted_add_pipeline];
+            [enc setBuffer:g_buf_out offset:0 atIndex:0];
+            [enc setBuffer:g_buf_down_out offset:0 atIndex:1];
+            [enc setBytes:&w length:sizeof(float) atIndex:2];
+            [enc setBytes:wadd_p length:sizeof(uint32_t) atIndex:3];
+            NSUInteger tpg = g_weighted_add_pipeline.maxTotalThreadsPerThreadgroup;
+            if (tpg > 256) tpg = 256;
+            [enc dispatchThreads:MTLSizeMake(n_embd,1,1) threadsPerThreadgroup:MTLSizeMake(tpg,1,1)];
+        }
+
+        [enc endEncoding];
+        [cmd commit];
+        // DON'T wait — return immediately so caller can start next layer's IO
+
+        g_deferred_cmd = cmd;
+        g_deferred_n_embd = n_embd;
+    }
+
+    return true;
+}
+
+// Read back the deferred result. Must call before using `out`.
+bool flash_expert_metal_wait_deferred(float * out) {
+    if (!g_deferred_cmd) return false;
+
+    [g_deferred_cmd waitUntilCompleted];
+    g_deferred_cmd = nil;
+
+    memcpy(out, [g_buf_out contents], g_deferred_n_embd * sizeof(float));
     return true;
 }
 
