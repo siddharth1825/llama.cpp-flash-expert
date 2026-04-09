@@ -99,8 +99,12 @@ bool flash_expert_metal_init(int64_t max_dim, int64_t max_expert_bytes) {
             return false;
         }
 
-        // Use scalar kernel (SIMD kernel has correctness issues at large context)
-        id<MTLFunction> matvec_fn = [library newFunctionWithName:@"dequant_matvec"];
+        // Prefer SIMD kernel (32 threads per row with simd_sum reduction)
+        id<MTLFunction> matvec_fn = [library newFunctionWithName:@"dequant_matvec_simd"];
+        if (!matvec_fn) {
+            fprintf(stderr, "[flash-expert-metal] SIMD kernel not found, using scalar\n");
+            matvec_fn = [library newFunctionWithName:@"dequant_matvec"];
+        }
         id<MTLFunction> swiglu_fn = [library newFunctionWithName:@"swiglu_fused"];
         id<MTLFunction> wadd_fn   = [library newFunctionWithName:@"weighted_add"];
 
@@ -157,10 +161,9 @@ static void dispatch_matvec(
     [enc setBuffer:out_buf offset:0 atIndex:2];
     [enc setBytes:params length:sizeof(params) atIndex:3];
 
-    NSUInteger tpg = g_matvec_pipeline.maxTotalThreadsPerThreadgroup;
-    if (tpg > 256) tpg = 256;
-    [enc dispatchThreads:MTLSizeMake(out_dim, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    // SIMD: one threadgroup of 32 threads per output row
+    [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
 static void dispatch_swiglu(

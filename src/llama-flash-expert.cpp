@@ -322,18 +322,31 @@ static bool flash_expert_callback(
             }
         }
 
-        // Phase 2: Per-expert Metal compute (correct, ~1.7 tok/s)
-        for (int64_t k = 0; k < n_expert_used && k < FlashExpertState::MAX_K; k++) {
-            if (!expert_data_ptrs[k]) continue;
-            flash_expert_metal_compute(
-                expert_data_ptrs[k],
-                li.tensor_offsets[0], li.tensor_sizes[0], layer_gate_type,
-                li.tensor_offsets[1], li.tensor_sizes[1], layer_up_type,
-                li.tensor_offsets[2], li.tensor_sizes[2], layer_down_type,
-                x, out, n_embd, n_ff, expert_weights[k]);
+        // Phase 2: Batched Metal compute — all routed experts in ONE command buffer
+        // (reduces 8 commit+wait to 1)
+        {
+            FlashExpertEntry entries[FlashExpertState::MAX_K];
+            int n_entries = 0;
+            for (int64_t k = 0; k < n_expert_used && k < FlashExpertState::MAX_K; k++) {
+                if (!expert_data_ptrs[k]) continue;
+                FlashExpertEntry e = {};
+                e.data = expert_data_ptrs[k];
+                e.gate_offset = li.tensor_offsets[0]; e.gate_bytes = li.tensor_sizes[0];
+                e.up_offset = li.tensor_offsets[1]; e.up_bytes = li.tensor_sizes[1];
+                e.down_offset = li.tensor_offsets[2]; e.down_bytes = li.tensor_sizes[2];
+                e.gate_type = layer_gate_type; e.up_type = layer_up_type; e.down_type = layer_down_type;
+                e.weight = expert_weights[k];
+                entries[n_entries++] = e;
+            }
+
+            // Batch routed experts only (one Metal commit instead of K)
+            flash_expert_metal_compute_batch(
+                entries, n_entries,
+                nullptr, nullptr,  // shared expert handled separately below
+                x, out, n_embd, n_ff);
         }
 
-        // Shared expert FFN (cached in RAM — no SSD read)
+        // Shared expert FFN — separate call with sigmoid gate (cached in RAM)
         if (li.shared_bytes > 0 && s.n_shared_tensors >= 3 &&
             s.shared_cached && !s.shared_cache[layer].empty()) {
             const uint8_t * shared_data = s.shared_cache[layer].data();
