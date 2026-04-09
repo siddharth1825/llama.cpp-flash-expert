@@ -438,53 +438,52 @@ bool flash_expert_metal_compute_batch_deferred(
         g_deferred_cmd = nil;
     }
 
-    @autoreleasepool {
-        memcpy([g_buf_x contents], x, n_embd * sizeof(float));
-        memset([g_buf_out contents], 0, n_embd * sizeof(float));
+    // NO @autoreleasepool — we need cmd to survive until wait_deferred is called
+    memcpy([g_buf_x contents], x, n_embd * sizeof(float));
+    memset([g_buf_out contents], 0, n_embd * sizeof(float));
 
-        id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
-        int64_t slot_size = g_max_expert_bytes;
-        for (int e = 0; e < n_experts; e++) {
-            int64_t total = experts[e].down_offset + experts[e].down_bytes;
-            memcpy((uint8_t *)[g_buf_expert contents] + e * slot_size, experts[e].data, total);
-        }
-
-        for (int e = 0; e < n_experts; e++) {
-            const auto & exp = experts[e];
-            uint64_t base = (uint64_t)e * slot_size;
-            uint32_t gate_tid = ggml_type_to_shader_id(exp.gate_type);
-            uint32_t up_tid   = ggml_type_to_shader_id(exp.up_type);
-            uint32_t down_tid = ggml_type_to_shader_id(exp.down_type);
-
-            dispatch_matvec(enc, g_buf_expert, base + exp.gate_offset, g_buf_x, g_buf_gate_out,
-                            (uint32_t)n_ff, (uint32_t)n_embd, gate_tid);
-            dispatch_matvec(enc, g_buf_expert, base + exp.up_offset, g_buf_x, g_buf_up_out,
-                            (uint32_t)n_ff, (uint32_t)n_embd, up_tid);
-            dispatch_swiglu(enc, g_buf_gate_out, g_buf_up_out, (uint32_t)n_ff);
-            dispatch_matvec(enc, g_buf_expert, base + exp.down_offset, g_buf_gate_out, g_buf_down_out,
-                            (uint32_t)n_embd, (uint32_t)n_ff, down_tid);
-
-            float w = exp.weight;
-            uint32_t wadd_p[1] = { (uint32_t)n_embd };
-            [enc setComputePipelineState:g_weighted_add_pipeline];
-            [enc setBuffer:g_buf_out offset:0 atIndex:0];
-            [enc setBuffer:g_buf_down_out offset:0 atIndex:1];
-            [enc setBytes:&w length:sizeof(float) atIndex:2];
-            [enc setBytes:wadd_p length:sizeof(uint32_t) atIndex:3];
-            NSUInteger tpg = g_weighted_add_pipeline.maxTotalThreadsPerThreadgroup;
-            if (tpg > 256) tpg = 256;
-            [enc dispatchThreads:MTLSizeMake(n_embd,1,1) threadsPerThreadgroup:MTLSizeMake(tpg,1,1)];
-        }
-
-        [enc endEncoding];
-        [cmd commit];
-        // DON'T wait — return immediately so caller can start next layer's IO
-
-        g_deferred_cmd = cmd;
-        g_deferred_n_embd = n_embd;
+    int64_t slot_size = g_max_expert_bytes;
+    for (int e = 0; e < n_experts; e++) {
+        int64_t total = experts[e].down_offset + experts[e].down_bytes;
+        memcpy((uint8_t *)[g_buf_expert contents] + e * slot_size, experts[e].data, total);
     }
+
+    for (int e = 0; e < n_experts; e++) {
+        const auto & exp = experts[e];
+        uint64_t base = (uint64_t)e * slot_size;
+        uint32_t gate_tid = ggml_type_to_shader_id(exp.gate_type);
+        uint32_t up_tid   = ggml_type_to_shader_id(exp.up_type);
+        uint32_t down_tid = ggml_type_to_shader_id(exp.down_type);
+
+        dispatch_matvec(enc, g_buf_expert, base + exp.gate_offset, g_buf_x, g_buf_gate_out,
+                        (uint32_t)n_ff, (uint32_t)n_embd, gate_tid);
+        dispatch_matvec(enc, g_buf_expert, base + exp.up_offset, g_buf_x, g_buf_up_out,
+                        (uint32_t)n_ff, (uint32_t)n_embd, up_tid);
+        dispatch_swiglu(enc, g_buf_gate_out, g_buf_up_out, (uint32_t)n_ff);
+        dispatch_matvec(enc, g_buf_expert, base + exp.down_offset, g_buf_gate_out, g_buf_down_out,
+                        (uint32_t)n_embd, (uint32_t)n_ff, down_tid);
+
+        float w = exp.weight;
+        uint32_t wadd_p[1] = { (uint32_t)n_embd };
+        [enc setComputePipelineState:g_weighted_add_pipeline];
+        [enc setBuffer:g_buf_out offset:0 atIndex:0];
+        [enc setBuffer:g_buf_down_out offset:0 atIndex:1];
+        [enc setBytes:&w length:sizeof(float) atIndex:2];
+        [enc setBytes:wadd_p length:sizeof(uint32_t) atIndex:3];
+        NSUInteger tpg = g_weighted_add_pipeline.maxTotalThreadsPerThreadgroup;
+        if (tpg > 256) tpg = 256;
+        [enc dispatchThreads:MTLSizeMake(n_embd,1,1) threadsPerThreadgroup:MTLSizeMake(tpg,1,1)];
+    }
+
+    [enc endEncoding];
+    [cmd commit];
+    // DON'T wait — GPU starts computing, caller can do CPU work
+
+    g_deferred_cmd = cmd;  // strong ref keeps cmd alive
+    g_deferred_n_embd = n_embd;
 
     return true;
 }
