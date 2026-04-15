@@ -32,3 +32,19 @@ bool llama_flash_expert_init(const std::string & experts_dir, const std::vector<
 
 // Shut down: close fds, free buffers, clear hook.
 void llama_flash_expert_free();
+
+// ── Deferred pipeline interface ──
+// Used by flash-forward for pipeline parallelism.
+// Same as the standard callback but submits Metal GPU work without waiting.
+// Call flash_expert_wait_deferred() to collect the result before reading output.
+
+// Run expert callback for one layer with deferred Metal compute.
+// The output buffer is NOT populated when this returns — the GPU is still running.
+bool flash_expert_callback_deferred(
+    const float * hidden, int64_t n_embd, int64_t n_tokens,
+    const int32_t * indices, const float * weights,
+    int64_t n_expert_used, int layer, float * output);
+
+// Wait for the previous deferred expert to finish and copy result to `out`.
+// Must be called before reading the output from the previous deferred call.
+bool flash_expert_wait_deferred(float * out);

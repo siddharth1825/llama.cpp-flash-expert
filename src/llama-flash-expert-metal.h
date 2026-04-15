@@ -64,13 +64,26 @@ bool flash_expert_metal_compute_batch(
     int64_t n_ff);
 
 // Deferred batch: commit without waiting, overlap with next layer's IO.
+// Includes shared expert in the same command buffer for pipeline efficiency.
+// Uses GGML's Metal queue when set (FIFO with attention commands).
 // Call flash_expert_metal_wait_deferred() before reading result.
 bool flash_expert_metal_compute_batch_deferred(
     const FlashExpertEntry * experts, int n_experts,
+    const FlashExpertEntry * shared,  // nullptr if no shared expert
     const float * x, float * out,
     int64_t n_embd, int64_t n_ff);
 
 bool flash_expert_metal_wait_deferred(float * out);
+bool flash_expert_metal_compute_shared_deferred(
+    const void * shared_data,
+    int64_t gate_offset, int64_t gate_bytes, enum ggml_type gate_type,
+    int64_t up_offset,   int64_t up_bytes,   enum ggml_type up_type,
+    int64_t down_offset, int64_t down_bytes,  enum ggml_type down_type,
+    const float * gate_inp_data,
+    const float * x, float * out,
+    int64_t n_embd, int64_t n_ff);
+
+bool flash_expert_metal_wait_shared_deferred(float * out);
 
 // Set GGML's Metal command queue for pipeline parallelism.
 // When set, expert Metal commands are submitted to GGML's queue instead

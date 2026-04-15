@@ -340,6 +340,21 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Custom split execution: replaces compute_splits with a user callback per split.
+    // Input tensor copies are handled internally (same as standard path).
+    // The callback is called twice per split:
+    //   pre_copy=true  → before input copies (use to collect deferred results)
+    //   pre_copy=false → after input copies (use to execute the split graph)
+    // Returning non-SUCCESS aborts execution.
+    // Precondition: alloc_graph must have been called already.
+    typedef enum ggml_status (*ggml_backend_sched_split_compute_fn)(
+            int split_id, ggml_backend_t backend, struct ggml_cgraph * split_graph,
+            bool pre_copy, void * user_data);
+    GGML_API enum ggml_status ggml_backend_sched_compute_splits_custom(
+            ggml_backend_sched_t sched,
+            ggml_backend_sched_split_compute_fn cb,
+            void * user_data);
+
     //
     // Utils
     //

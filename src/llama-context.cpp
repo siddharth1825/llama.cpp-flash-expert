@@ -2,6 +2,7 @@
 
 #include "llama-arch.h"
 #include "llama-remote-expert.h"
+#include "llama-flash-forward.h"
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
 #endif
@@ -2185,6 +2186,19 @@ ggml_status llama_context::graph_compute(
 
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+
+    // Flash-forward pipeline: when flash-expert is active, use custom split
+    // execution that defers expert GPU work for pipeline parallelism.
+    auto * hook = llama_get_remote_expert_hook();
+    if (hook && hook->enabled) {
+        // alloc_graph was already called in process_ubatch — go straight to compute
+        auto status = flash_forward_compute(sched.get());
+        if (status != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: flash_forward_compute failed: %d, falling back\n", __func__, status);
+        } else {
+            return status;
+        }
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);

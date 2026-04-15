@@ -21,6 +21,7 @@ add_library(llama
             llama-remote-expert-client.cpp
             llama-flash-expert.cpp
             llama-flash-expert-metal.mm
+            llama-flash-forward.cpp
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp
@@ -162,6 +163,7 @@ set_target_properties(llama PROPERTIES
 )
 
 target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE ../ggml/src)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

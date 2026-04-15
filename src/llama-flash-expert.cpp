@@ -366,6 +366,11 @@ static bool flash_expert_callback(
         }
     }
 
+    if (s.total_calls < 3) {
+        fprintf(stderr, "[standard-cb] layer %d: out=[%.6f, %.6f] (routed+shared)\n",
+            layer, output[0], output[1]);
+    }
+
     auto t1 = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     s.total_ms += ms;
@@ -380,6 +385,161 @@ static bool flash_expert_callback(
     }
 
     return true;
+}
+
+// ── Deferred pipeline interface ────────────────────────────────────
+// Identical to flash_expert_callback but submits Metal GPU work without
+// waiting. The output buffer is NOT populated when this returns.
+
+bool flash_expert_callback_deferred(
+        const float * hidden,
+        int64_t       n_embd,
+        int64_t       n_tokens,
+        const int32_t * indices,
+        const float * weights,
+        int64_t       n_expert_used,
+        int           layer,
+        float *       output) {
+
+    auto & s = g_state;
+    if (!s.initialized || layer < 0 || layer >= s.n_layers) return false;
+
+    const auto & li = s.layers[layer];
+
+    // Ensure types/buffers are detected (they're set on first standard callback)
+    if (!s.types_detected) {
+        // Fall back to standard (blocking) callback for the first call
+        return flash_expert_callback(hidden, n_embd, n_tokens, indices, weights, n_expert_used, layer, output);
+    }
+
+    const int64_t n_ff = s.n_ff;
+    enum ggml_type layer_gate_type = detect_quant_type(li.tensor_sizes[0], n_ff * n_embd);
+    enum ggml_type layer_up_type   = detect_quant_type(li.tensor_sizes.size() > 1 ? li.tensor_sizes[1] : li.tensor_sizes[0], n_ff * n_embd);
+    enum ggml_type layer_down_type = detect_quant_type(li.tensor_sizes.size() > 2 ? li.tensor_sizes[2] : li.tensor_sizes[0], n_embd * n_ff);
+
+    for (int64_t t = 0; t < n_tokens; t++) {
+        const float * x = hidden + t * n_embd;
+        float * out = output + t * n_embd;
+        memset(out, 0, n_embd * sizeof(float));
+
+        // Phase 1: pread experts (same as standard callback)
+        const uint8_t * expert_data_ptrs[FlashExpertState::MAX_K] = {};
+        int32_t expert_indices[FlashExpertState::MAX_K];
+        float   expert_weights[FlashExpertState::MAX_K];
+        int     n_to_read = 0;
+        int     read_slots[FlashExpertState::MAX_K];
+
+        for (int64_t k = 0; k < n_expert_used && k < FlashExpertState::MAX_K; k++) {
+            expert_indices[k] = indices[t * n_expert_used + k];
+            expert_weights[k] = weights[t * n_expert_used + k];
+            if (expert_indices[k] < 0 || expert_indices[k] >= s.n_experts) continue;
+
+            if (!s.pinned.empty() && !s.pinned[layer].empty() &&
+                !s.pinned[layer][expert_indices[k]].empty()) {
+                expert_data_ptrs[k] = s.pinned[layer][expert_indices[k]].data();
+                s.pin_hits++;
+            } else {
+                read_slots[n_to_read++] = (int)k;
+            }
+        }
+
+        if (n_to_read > 0) {
+#ifdef __APPLE__
+            dispatch_group_t group = dispatch_group_create();
+            dispatch_queue_t io_queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+            for (int r = 0; r < n_to_read; r++) {
+                int k = read_slots[r];
+                int32_t eidx = expert_indices[k];
+                dispatch_group_async(group, io_queue, ^{
+                    off_t offset = (off_t)eidx * li.per_expert_bytes;
+                    pread_all(li.fd, s.expert_bufs[k].data(), li.per_expert_bytes, offset);
+                });
+            }
+            dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+#else
+            for (int r = 0; r < n_to_read; r++) {
+                int k = read_slots[r];
+                off_t offset = (off_t)expert_indices[k] * li.per_expert_bytes;
+                pread_all(li.fd, s.expert_bufs[k].data(), li.per_expert_bytes, offset);
+            }
+#endif
+            for (int r = 0; r < n_to_read; r++) {
+                int k = read_slots[r];
+                expert_data_ptrs[k] = s.expert_bufs[k].data();
+                s.ssd_reads++;
+            }
+        }
+
+        // Phase 2: Build entry arrays for deferred batch
+        FlashExpertEntry entries[FlashExpertState::MAX_K];
+        int n_entries = 0;
+        for (int64_t k = 0; k < n_expert_used && k < FlashExpertState::MAX_K; k++) {
+            if (!expert_data_ptrs[k]) continue;
+            FlashExpertEntry e = {};
+            e.data = expert_data_ptrs[k];
+            e.gate_offset = li.tensor_offsets[0]; e.gate_bytes = li.tensor_sizes[0];
+            e.up_offset = li.tensor_offsets[1]; e.up_bytes = li.tensor_sizes[1];
+            e.down_offset = li.tensor_offsets[2]; e.down_bytes = li.tensor_sizes[2];
+            e.gate_type = layer_gate_type; e.up_type = layer_up_type; e.down_type = layer_down_type;
+            e.weight = expert_weights[k];
+            entries[n_entries++] = e;
+        }
+
+        // Build shared expert entry
+        FlashExpertEntry shared_entry = {};
+        FlashExpertEntry * shared_ptr = nullptr;
+        if (li.shared_bytes > 0 && s.n_shared_tensors >= 3 &&
+            s.shared_cached && !s.shared_cache[layer].empty()) {
+            const uint8_t * shared_data = s.shared_cache[layer].data();
+            shared_entry.data = shared_data;
+            shared_entry.gate_offset = 0; shared_entry.gate_bytes = li.tensor_sizes[0];
+            shared_entry.up_offset = li.tensor_sizes[0]; shared_entry.up_bytes = li.tensor_sizes[1];
+            int64_t sh_down_off = li.tensor_sizes[0] + li.tensor_sizes[1];
+            shared_entry.down_offset = sh_down_off; shared_entry.down_bytes = li.tensor_sizes[2];
+            shared_entry.gate_type = layer_gate_type; shared_entry.up_type = layer_up_type;
+            shared_entry.down_type = layer_down_type;
+            shared_entry.weight = 1.0f;
+            shared_ptr = &shared_entry;
+        }
+
+        // Phase 3: Routed expert — DEFERRED (set A buffers)
+        flash_expert_metal_compute_batch_deferred(
+            entries, n_entries, nullptr, x, out, n_embd, n_ff);
+        // Wait inline (correctness > speed until we find the pre_copy bug)
+        flash_expert_metal_wait_deferred(out);
+
+        // Phase 4: Shared expert — BLOCKING (set B buffers, safe after routed done)
+        if (li.shared_bytes > 0 && s.n_shared_tensors >= 3 &&
+            s.shared_cached && !s.shared_cache[layer].empty()) {
+            const uint8_t * shared_data = s.shared_cache[layer].data();
+            int64_t sh_up_off = li.tensor_sizes[0];
+            int64_t sh_down_off = sh_up_off + li.tensor_sizes[1];
+            const float * gate_inp_ptr2 = nullptr;
+            if (s.n_shared_tensors >= 4) {
+                int64_t gate_inp_off = sh_down_off + li.tensor_sizes[2];
+                gate_inp_ptr2 = reinterpret_cast<const float *>(shared_data + gate_inp_off);
+            }
+            flash_expert_metal_compute_shared(
+                shared_data,
+                0, li.tensor_sizes[0], layer_gate_type,
+                sh_up_off, li.tensor_sizes[1], layer_up_type,
+                sh_down_off, li.tensor_sizes[2], layer_down_type,
+                gate_inp_ptr2, x, out, n_embd, n_ff);
+        }
+    }
+
+    if (s.total_calls < 3) {
+        float * out0 = output;
+        fprintf(stderr, "[deferred-cb] layer %d: out=[%.6f, %.6f] (after shared)\n",
+            layer, out0[0], out0[1]);
+    }
+
+    s.total_calls++;
+    return true;
+}
+
+bool flash_expert_wait_deferred(float * out) {
+    return flash_expert_metal_wait_deferred(out);
 }
 
 // ── Public API ─────────────────────────────────────────────────────
