@@ -497,12 +497,12 @@ bool flash_expert_callback_deferred(
             shared_ptr = &shared_entry;
         }
 
-        // Phase 3: Routed expert — DEFERRED + inline wait
+        // Phase 3: Routed expert — DEFERRED
         flash_expert_metal_compute_batch_deferred(
             entries, n_entries, nullptr, x, out, n_embd, n_ff);
-        flash_expert_metal_wait_deferred(out);
 
-        // Phase 4: Shared expert — BLOCKING (set B buffers)
+        // Phase 4: Shared expert — DEFERRED
+        bool has_shared = false;
         if (li.shared_bytes > 0 && s.n_shared_tensors >= 3 &&
             s.shared_cached && !s.shared_cache[layer].empty()) {
             const uint8_t * shared_data = s.shared_cache[layer].data();
@@ -513,12 +513,24 @@ bool flash_expert_callback_deferred(
                 int64_t gate_inp_off = sh_down_off + li.tensor_sizes[2];
                 gate_inp_ptr2 = reinterpret_cast<const float *>(shared_data + gate_inp_off);
             }
-            flash_expert_metal_compute_shared(
+            flash_expert_metal_compute_shared_deferred(
                 shared_data,
                 0, li.tensor_sizes[0], layer_gate_type,
                 sh_up_off, li.tensor_sizes[1], layer_up_type,
                 sh_down_off, li.tensor_sizes[2], layer_down_type,
                 gate_inp_ptr2, x, out, n_embd, n_ff);
+            has_shared = true;
+        }
+
+        // CRITICAL: For n_tokens > 1 (prefill), the next token's commit will
+        // overwrite g_buf_out. We MUST collect this token's result before
+        // moving to the next iteration. Only the LAST token can be left
+        // deferred (collected by pre_copy of the next split).
+        if (t + 1 < n_tokens) {
+            flash_expert_metal_wait_deferred(out);
+            if (has_shared) {
+                flash_expert_metal_wait_shared_deferred(out);
+            }
         }
     }
 
