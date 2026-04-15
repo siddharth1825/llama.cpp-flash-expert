@@ -366,11 +366,6 @@ static bool flash_expert_callback(
         }
     }
 
-    if (s.total_calls < 3) {
-        fprintf(stderr, "[standard-cb] layer %d: out=[%.6f, %.6f] (routed+shared)\n",
-            layer, output[0], output[1]);
-    }
-
     auto t1 = std::chrono::high_resolution_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     s.total_ms += ms;
@@ -502,13 +497,12 @@ bool flash_expert_callback_deferred(
             shared_ptr = &shared_entry;
         }
 
-        // Phase 3: Routed expert — DEFERRED (set A buffers)
+        // Phase 3: Routed expert — DEFERRED + inline wait
         flash_expert_metal_compute_batch_deferred(
             entries, n_entries, nullptr, x, out, n_embd, n_ff);
-        // Wait inline (correctness > speed until we find the pre_copy bug)
         flash_expert_metal_wait_deferred(out);
 
-        // Phase 4: Shared expert — BLOCKING (set B buffers, safe after routed done)
+        // Phase 4: Shared expert — BLOCKING (set B buffers)
         if (li.shared_bytes > 0 && s.n_shared_tensors >= 3 &&
             s.shared_cached && !s.shared_cache[layer].empty()) {
             const uint8_t * shared_data = s.shared_cache[layer].data();
@@ -526,12 +520,6 @@ bool flash_expert_callback_deferred(
                 sh_down_off, li.tensor_sizes[2], layer_down_type,
                 gate_inp_ptr2, x, out, n_embd, n_ff);
         }
-    }
-
-    if (s.total_calls < 3) {
-        float * out0 = output;
-        fprintf(stderr, "[deferred-cb] layer %d: out=[%.6f, %.6f] (after shared)\n",
-            layer, out0[0], out0[1]);
     }
 
     s.total_calls++;

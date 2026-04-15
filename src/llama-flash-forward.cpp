@@ -54,10 +54,14 @@ static enum ggml_status flash_forward_split_callback(
     (void)split_id;
 
     if (pre_copy) {
-        // Nothing to collect — the callback already waited inline.
-        // (Reserved for future pipelined implementation.)
-        state->has_deferred = false;
-        state->deferred_out = nullptr;
+        // Reserved for future fully-deferred mode. Currently the callback
+        // waits inline (correctness-first), so has_deferred is never true here.
+        if (state->has_deferred && state->deferred_out) {
+            flash_expert_wait_deferred(state->deferred_out);
+            flash_expert_metal_wait_shared_deferred(state->deferred_out);
+            state->has_deferred = false;
+            state->deferred_out = nullptr;
+        }
         return GGML_STATUS_SUCCESS;
     }
 
@@ -101,6 +105,10 @@ static enum ggml_status flash_forward_split_callback(
 
     if (!ok) {
         p.fun(expert_node, expert_node->src[0], expert_node->src[1], expert_node->src[2], 0, 1, p.userdata);
+    } else {
+        state->has_deferred = true;
+        state->deferred_out = output;
+        state->deferred_n_embd = n_embd;
     }
     state->n_expert_splits++;
 
