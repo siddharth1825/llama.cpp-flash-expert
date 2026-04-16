@@ -91,4 +91,34 @@ bool flash_expert_metal_wait_shared_deferred(float * out);
 // Call this after llama_context is created (which creates the Metal backend).
 void flash_expert_metal_set_ggml_queue(void * queue);
 
+// ── Batched (prefill) path ─────────────────────────────────────────
+// Compute one expert's FFN across a batch of tokens in a single Metal commit.
+// X: [batch × n_embd] float, rows are per-token input
+// Y: [batch × n_embd] float, rows will hold per-token W_down @ SwiGLU(W_gate@x, W_up@x)
+// (NOT multiplied by routing weight — caller scatter-accumulates with weights).
+bool flash_expert_metal_compute_batched(
+    const void * expert_data,
+    int64_t gate_offset, int64_t gate_bytes, enum ggml_type gate_type,
+    int64_t up_offset,   int64_t up_bytes,   enum ggml_type up_type,
+    int64_t down_offset, int64_t down_bytes,  enum ggml_type down_type,
+    const float * X,
+    float       * Y,
+    int64_t batch,
+    int64_t n_embd,
+    int64_t n_ff);
+
+// Shared expert over a batch. Weights are already resident in RAM; we upload
+// once. Output Y[batch × n_embd] = W_down @ SwiGLU(W_gate @ X, W_up @ X).
+// Caller multiplies each row by its per-token gate_val and accumulates.
+bool flash_expert_metal_compute_shared_batched(
+    const void * shared_data,
+    int64_t gate_offset, int64_t gate_bytes, enum ggml_type gate_type,
+    int64_t up_offset,   int64_t up_bytes,   enum ggml_type up_type,
+    int64_t down_offset, int64_t down_bytes,  enum ggml_type down_type,
+    const float * X,
+    float       * Y,
+    int64_t batch,
+    int64_t n_embd,
+    int64_t n_ff);
+
 void flash_expert_metal_free();

@@ -193,6 +193,138 @@ static enum ggml_type detect_quant_type(int64_t bytes, int64_t n_elements) {
 
 // ── Flash expert callback ──────────────────────────────────────────
 
+// ── Batched prefill path (n_tokens > 1) ────────────────────────────
+// Expert-major iteration: each unique expert used by the batch is loaded
+// from SSD / pinned cache ONCE, then processed with a batched matmul
+// across all tokens routed to it. Replaces the per-token serial loop
+// which memcpy'd every expert once per token.
+static bool flash_expert_prefill_batched(
+        const float * hidden,
+        int64_t       n_embd,
+        int64_t       n_tokens,
+        const int32_t * indices,
+        const float * weights,
+        int64_t       n_expert_used,
+        int           layer,
+        float *       output,
+        enum ggml_type layer_gate_type,
+        enum ggml_type layer_up_type,
+        enum ggml_type layer_down_type) {
+
+    auto & s = g_state;
+    const auto & li = s.layers[layer];
+    const int64_t n_ff = s.n_ff;
+
+    // Zero the whole output block once
+    std::memset(output, 0, (size_t)n_tokens * n_embd * sizeof(float));
+
+    // Build expert → (token_idx, weight) routing
+    // experts up to s.n_experts; use vector<vector<>> so empty experts cost nothing.
+    std::vector<std::vector<int32_t>> exp_tokens(s.n_experts);
+    std::vector<std::vector<float>>   exp_weights(s.n_experts);
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t k = 0; k < n_expert_used; k++) {
+            int32_t e = indices[t * n_expert_used + k];
+            if (e < 0 || e >= s.n_experts) continue;
+            exp_tokens[e].push_back((int32_t)t);
+            exp_weights[e].push_back(weights[t * n_expert_used + k]);
+        }
+    }
+
+    // Scratch for gathered inputs / outputs of one expert's batch
+    std::vector<float> X_gather((size_t)n_tokens * n_embd);
+    std::vector<float> Y_gather((size_t)n_tokens * n_embd);
+
+    // Process each unique expert
+    for (int32_t e = 0; e < s.n_experts; e++) {
+        const auto & tok_list = exp_tokens[e];
+        if (tok_list.empty()) continue;
+        int64_t batch = (int64_t)tok_list.size();
+
+        // Resolve expert weight pointer: pinned RAM or pread from SSD
+        const uint8_t * exp_data = nullptr;
+        if (!s.pinned.empty() && !s.pinned[layer].empty() &&
+            !s.pinned[layer][e].empty()) {
+            exp_data = s.pinned[layer][e].data();
+            s.pin_hits += batch;  // counts as a hit for each routing pick it serves
+        } else {
+            off_t offset = (off_t)e * li.per_expert_bytes;
+            if (!pread_all(li.fd, s.expert_bufs[0].data(), li.per_expert_bytes, offset)) {
+                return false;
+            }
+            exp_data = s.expert_bufs[0].data();
+            s.ssd_reads++;  // one read serves all tokens routed here
+        }
+
+        // Gather inputs
+        for (int64_t i = 0; i < batch; i++) {
+            std::memcpy(&X_gather[i * n_embd],
+                        &hidden[(int64_t)tok_list[i] * n_embd],
+                        n_embd * sizeof(float));
+        }
+
+        // One batched matmul pass: Y = W_down @ SwiGLU(W_gate @ X, W_up @ X)
+        if (!flash_expert_metal_compute_batched(
+                exp_data,
+                li.tensor_offsets[0], li.tensor_sizes[0], layer_gate_type,
+                li.tensor_offsets[1], li.tensor_sizes[1], layer_up_type,
+                li.tensor_offsets[2], li.tensor_sizes[2], layer_down_type,
+                X_gather.data(), Y_gather.data(),
+                batch, n_embd, n_ff)) {
+            return false;
+        }
+
+        // Scatter-accumulate weighted output back to the token rows
+        for (int64_t i = 0; i < batch; i++) {
+            const float * src = &Y_gather[i * n_embd];
+            float * dst = &output[(int64_t)tok_list[i] * n_embd];
+            const float w = exp_weights[e][i];
+            for (int64_t j = 0; j < n_embd; j++) dst[j] += w * src[j];
+        }
+    }
+
+    // Shared expert: one batched pass across ALL tokens, then per-token gate_val
+    if (li.shared_bytes > 0 && s.n_shared_tensors >= 3 &&
+        s.shared_cached && !s.shared_cache[layer].empty()) {
+
+        const uint8_t * shared_data = s.shared_cache[layer].data();
+        int64_t sh_up_off   = li.tensor_sizes[0];
+        int64_t sh_down_off = sh_up_off + li.tensor_sizes[1];
+        const float * gate_inp_ptr = nullptr;
+        if (s.n_shared_tensors >= 4) {
+            int64_t gate_inp_off = sh_down_off + li.tensor_sizes[2];
+            gate_inp_ptr = reinterpret_cast<const float *>(shared_data + gate_inp_off);
+        }
+
+        if (!flash_expert_metal_compute_shared_batched(
+                shared_data,
+                0,             li.tensor_sizes[0], layer_gate_type,
+                sh_up_off,     li.tensor_sizes[1], layer_up_type,
+                sh_down_off,   li.tensor_sizes[2], layer_down_type,
+                hidden, Y_gather.data(),
+                n_tokens, n_embd, n_ff)) {
+            return false;
+        }
+
+        // Compute per-token gate_val = sigmoid(<gate_inp, hidden[t]>)
+        // and accumulate into output.
+        for (int64_t t = 0; t < n_tokens; t++) {
+            float gate_val = 1.0f;
+            if (gate_inp_ptr) {
+                float dot = 0.0f;
+                const float * xt = &hidden[t * n_embd];
+                for (int64_t j = 0; j < n_embd; j++) dot += gate_inp_ptr[j] * xt[j];
+                gate_val = 1.0f / (1.0f + std::exp(-dot));
+            }
+            const float * src = &Y_gather[t * n_embd];
+            float       * dst = &output[t * n_embd];
+            for (int64_t j = 0; j < n_embd; j++) dst[j] += gate_val * src[j];
+        }
+    }
+
+    return true;
+}
+
 static bool flash_expert_callback(
         const float * hidden,
         int64_t       n_embd,
@@ -263,6 +395,18 @@ static bool flash_expert_callback(
     enum ggml_type layer_gate_type = detect_quant_type(li.tensor_sizes[0], n_ff * n_embd);
     enum ggml_type layer_up_type   = detect_quant_type(li.tensor_sizes.size() > 1 ? li.tensor_sizes[1] : li.tensor_sizes[0], n_ff * n_embd);
     enum ggml_type layer_down_type = detect_quant_type(li.tensor_sizes.size() > 2 ? li.tensor_sizes[2] : li.tensor_sizes[0], n_embd * n_ff);
+
+    // Prefill (n_tokens > 1): expert-major batched path.
+    if (n_tokens > 1) {
+        bool ok = flash_expert_prefill_batched(
+            hidden, n_embd, n_tokens, indices, weights, n_expert_used, layer, output,
+            layer_gate_type, layer_up_type, layer_down_type);
+        if (!ok) return false;
+        auto t1 = std::chrono::high_resolution_clock::now();
+        s.total_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        s.total_calls++;
+        return true;
+    }
 
     for (int64_t t = 0; t < n_tokens; t++) {
         const float * x = hidden + t * n_embd;
@@ -411,6 +555,18 @@ bool flash_expert_callback_deferred(
     enum ggml_type layer_gate_type = detect_quant_type(li.tensor_sizes[0], n_ff * n_embd);
     enum ggml_type layer_up_type   = detect_quant_type(li.tensor_sizes.size() > 1 ? li.tensor_sizes[1] : li.tensor_sizes[0], n_ff * n_embd);
     enum ggml_type layer_down_type = detect_quant_type(li.tensor_sizes.size() > 2 ? li.tensor_sizes[2] : li.tensor_sizes[0], n_embd * n_ff);
+
+    // Prefill (n_tokens > 1): route through the batched path.
+    // The caller (flash-forward) will see has_deferred=false and skip the wait;
+    // our batched path is fully blocking and has already populated output.
+    if (n_tokens > 1) {
+        bool ok = flash_expert_prefill_batched(
+            hidden, n_embd, n_tokens, indices, weights, n_expert_used, layer, output,
+            layer_gate_type, layer_up_type, layer_down_type);
+        if (!ok) return false;
+        s.total_calls++;
+        return true;
+    }
 
     for (int64_t t = 0; t < n_tokens; t++) {
         const float * x = hidden + t * n_embd;

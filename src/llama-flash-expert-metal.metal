@@ -198,3 +198,49 @@ kernel void weighted_add(
     if(tid>=params[0])return;
     out[tid]+=weight[0]*src[tid];
 }
+
+// Batched matmul: Y[out_dim × batch] = W[out_dim × in_dim] @ X[in_dim × batch]
+// W is quantized (Q3_K / Q4_K / Q5_K), X and Y are float32.
+// Layout: X has row-major rows per batch-item (X[bi*in_dim + j]);
+//         Y has row-major rows per batch-item (Y[bi*out_dim + i]).
+// Dispatch: grid (out_dim, batch, 1), threadgroup 32 threads — one TG per (row, batch).
+kernel void dequant_matmul(
+    device const uint8_t * W [[buffer(0)]],
+    device const float   * X [[buffer(1)]],
+    device float         * Y [[buffer(2)]],
+    constant uint        * params [[buffer(3)]], // out_dim, in_dim, type_id, batch
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint  lid [[thread_index_in_threadgroup]],
+    uint  simd_lane [[thread_index_in_simdgroup]]
+) {
+    uint out_dim=params[0], in_dim=params[1], type_id=params[2], batch=params[3];
+    uint row=gid.x, bi=gid.y;
+    if (row>=out_dim || bi>=batch) return;
+    uint bs=blk_bytes(type_id), nb=in_dim/QK_K, rb=nb*bs;
+    device const uint8_t * row_data = W + row*rb;
+    device const float   * xb = X + bi*in_dim;
+    float partial=0;
+    for (uint b=lid; b<nb; b+=32) {
+        device const uint8_t*blk=row_data+b*bs;
+        switch(type_id){
+            case TYPE_Q3K: partial+=q3k_block_dot(blk,xb,b*QK_K); break;
+            case TYPE_Q4K: partial+=q4k_block_dot(blk,xb,b*QK_K); break;
+            case TYPE_Q5K: partial+=q5k_block_dot(blk,xb,b*QK_K); break;
+            default: break;
+        }
+    }
+    partial=simd_sum(partial);
+    if (simd_lane==0) Y[bi*out_dim + row] = partial;
+}
+
+// SwiGLU across a whole batch: GATE[bi,i] = silu(GATE[bi,i]) * UP[bi,i]
+kernel void swiglu_batch(
+    device float * GATE [[buffer(0)]],
+    device const float * UP [[buffer(1)]],
+    constant uint * params [[buffer(2)]], // total = n_ff * batch
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= params[0]) return;
+    float g = GATE[tid];
+    GATE[tid] = (g / (1.0f + exp(-g))) * UP[tid];
+}

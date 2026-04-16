@@ -18,6 +18,17 @@ static id<MTLCommandQueue>        g_ggml_queue;   // GGML's queue (for pipeline 
 static id<MTLComputePipelineState> g_matvec_pipeline;
 static id<MTLComputePipelineState> g_swiglu_pipeline;
 static id<MTLComputePipelineState> g_weighted_add_pipeline;
+static id<MTLComputePipelineState> g_matmul_pipeline;       // batched prefill
+static id<MTLComputePipelineState> g_swiglu_batch_pipeline; // batched prefill
+
+// Lazy-allocated batch buffers for the prefill path. Grown to fit batch.
+static id<MTLBuffer> g_buf_x_batch;     // [max_batch * n_embd] float
+static id<MTLBuffer> g_buf_gate_batch;  // [max_batch * n_ff]   float
+static id<MTLBuffer> g_buf_up_batch;    // [max_batch * n_ff]   float
+static id<MTLBuffer> g_buf_y_batch;     // [max_batch * n_embd] float
+static int64_t       g_batch_cap   = 0;
+static int64_t       g_batch_n_embd = 0;
+static int64_t       g_batch_n_ff   = 0;
 
 // Persistent buffers — set A (routed experts, used by deferred path)
 static id<MTLBuffer> g_buf_expert;    // quantized expert weights (routed)
@@ -126,17 +137,22 @@ bool flash_expert_metal_init(int64_t max_dim, int64_t max_expert_bytes) {
         }
         id<MTLFunction> swiglu_fn = [library newFunctionWithName:@"swiglu_fused"];
         id<MTLFunction> wadd_fn   = [library newFunctionWithName:@"weighted_add"];
+        id<MTLFunction> matmul_fn = [library newFunctionWithName:@"dequant_matmul"];
+        id<MTLFunction> swig_b_fn = [library newFunctionWithName:@"swiglu_batch"];
 
-        if (!matvec_fn || !swiglu_fn || !wadd_fn) {
+        if (!matvec_fn || !swiglu_fn || !wadd_fn || !matmul_fn || !swig_b_fn) {
             fprintf(stderr, "[flash-expert-metal] Missing shader functions\n");
             return false;
         }
 
-        g_matvec_pipeline       = [g_device newComputePipelineStateWithFunction:matvec_fn error:&error];
-        g_swiglu_pipeline       = [g_device newComputePipelineStateWithFunction:swiglu_fn error:&error];
-        g_weighted_add_pipeline = [g_device newComputePipelineStateWithFunction:wadd_fn error:&error];
+        g_matvec_pipeline         = [g_device newComputePipelineStateWithFunction:matvec_fn error:&error];
+        g_swiglu_pipeline         = [g_device newComputePipelineStateWithFunction:swiglu_fn error:&error];
+        g_weighted_add_pipeline   = [g_device newComputePipelineStateWithFunction:wadd_fn error:&error];
+        g_matmul_pipeline         = [g_device newComputePipelineStateWithFunction:matmul_fn error:&error];
+        g_swiglu_batch_pipeline   = [g_device newComputePipelineStateWithFunction:swig_b_fn error:&error];
 
-        if (!g_matvec_pipeline || !g_swiglu_pipeline || !g_weighted_add_pipeline) {
+        if (!g_matvec_pipeline || !g_swiglu_pipeline || !g_weighted_add_pipeline ||
+            !g_matmul_pipeline || !g_swiglu_batch_pipeline) {
             fprintf(stderr, "[flash-expert-metal] Failed to create pipelines: %s\n",
                 [[error localizedDescription] UTF8String]);
             return false;
@@ -647,6 +663,202 @@ void flash_expert_metal_set_ggml_queue(void * queue) {
     }
 }
 
+// ── Batched prefill path ─────────────────────────────────────────────
+// Grow the lazy batch buffers to fit `batch` tokens for an (n_embd, n_ff) model.
+static void ensure_batch_buffers(int64_t batch, int64_t n_embd, int64_t n_ff) {
+    if (batch <= g_batch_cap && n_embd == g_batch_n_embd && n_ff == g_batch_n_ff &&
+        g_buf_x_batch != nil) {
+        return;
+    }
+    size_t x_bytes    = (size_t)batch * n_embd * sizeof(float);
+    size_t ff_bytes   = (size_t)batch * n_ff   * sizeof(float);
+    size_t out_bytes  = x_bytes;
+
+    g_buf_x_batch    = [g_device newBufferWithLength:x_bytes   options:MTLResourceStorageModeShared];
+    g_buf_gate_batch = [g_device newBufferWithLength:ff_bytes  options:MTLResourceStorageModeShared];
+    g_buf_up_batch   = [g_device newBufferWithLength:ff_bytes  options:MTLResourceStorageModeShared];
+    g_buf_y_batch    = [g_device newBufferWithLength:out_bytes options:MTLResourceStorageModeShared];
+    g_batch_cap    = batch;
+    g_batch_n_embd = n_embd;
+    g_batch_n_ff   = n_ff;
+}
+
+// One Metal command buffer does: gate matmul → up matmul → batched swiglu →
+// down matmul for `batch` tokens through the supplied expert.
+bool flash_expert_metal_compute_batched(
+        const void * expert_data,
+        int64_t gate_offset, int64_t gate_bytes, enum ggml_type gate_type,
+        int64_t up_offset,   int64_t up_bytes,   enum ggml_type up_type,
+        int64_t down_offset, int64_t down_bytes, enum ggml_type down_type,
+        const float * X,
+        float       * Y,
+        int64_t batch,
+        int64_t n_embd,
+        int64_t n_ff) {
+
+    if (!g_initialized || batch <= 0) return false;
+    (void)gate_bytes; (void)up_bytes;
+
+    @autoreleasepool {
+        ensure_batch_buffers(batch, n_embd, n_ff);
+
+        // Upload expert weights into slot 0 of g_buf_expert
+        int64_t total = down_offset + down_bytes;
+        memcpy([g_buf_expert contents], expert_data, total);
+        // Upload inputs (row-major, one row per token)
+        memcpy([g_buf_x_batch contents], X, (size_t)batch * n_embd * sizeof(float));
+
+        uint32_t gate_tid = ggml_type_to_shader_id(gate_type);
+        uint32_t up_tid   = ggml_type_to_shader_id(up_type);
+        uint32_t down_tid = ggml_type_to_shader_id(down_type);
+
+        id<MTLCommandQueue> active_queue = g_ggml_queue ? g_ggml_queue : g_queue;
+        id<MTLCommandBuffer> cmd = [active_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        // GATE = W_gate @ X   [n_ff × batch]
+        {
+            uint32_t params[4] = { (uint32_t)n_ff, (uint32_t)n_embd, gate_tid, (uint32_t)batch };
+            [enc setComputePipelineState:g_matmul_pipeline];
+            [enc setBuffer:g_buf_expert   offset:gate_offset atIndex:0];
+            [enc setBuffer:g_buf_x_batch  offset:0           atIndex:1];
+            [enc setBuffer:g_buf_gate_batch offset:0         atIndex:2];
+            [enc setBytes:params length:sizeof(params)       atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(n_ff, batch, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+        // UP = W_up @ X       [n_ff × batch]
+        {
+            uint32_t params[4] = { (uint32_t)n_ff, (uint32_t)n_embd, up_tid, (uint32_t)batch };
+            [enc setComputePipelineState:g_matmul_pipeline];
+            [enc setBuffer:g_buf_expert offset:up_offset atIndex:0];
+            [enc setBuffer:g_buf_x_batch offset:0        atIndex:1];
+            [enc setBuffer:g_buf_up_batch offset:0       atIndex:2];
+            [enc setBytes:params length:sizeof(params)   atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(n_ff, batch, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+        // SwiGLU(GATE, UP) → GATE, elementwise over n_ff*batch
+        {
+            uint32_t total_elems = (uint32_t)(batch * n_ff);
+            uint32_t params[1] = { total_elems };
+            [enc setComputePipelineState:g_swiglu_batch_pipeline];
+            [enc setBuffer:g_buf_gate_batch offset:0 atIndex:0];
+            [enc setBuffer:g_buf_up_batch   offset:0 atIndex:1];
+            [enc setBytes:params length:sizeof(params) atIndex:2];
+            NSUInteger tpg = g_swiglu_batch_pipeline.maxTotalThreadsPerThreadgroup;
+            if (tpg > 256) tpg = 256;
+            [enc dispatchThreads:MTLSizeMake(total_elems, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        }
+        // Y = W_down @ GATE   [n_embd × batch]
+        {
+            uint32_t params[4] = { (uint32_t)n_embd, (uint32_t)n_ff, down_tid, (uint32_t)batch };
+            [enc setComputePipelineState:g_matmul_pipeline];
+            [enc setBuffer:g_buf_expert    offset:down_offset atIndex:0];
+            [enc setBuffer:g_buf_gate_batch offset:0          atIndex:1];
+            [enc setBuffer:g_buf_y_batch   offset:0           atIndex:2];
+            [enc setBytes:params length:sizeof(params)        atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(n_embd, batch, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        memcpy(Y, [g_buf_y_batch contents], (size_t)batch * n_embd * sizeof(float));
+    }
+    return true;
+}
+
+// Same as compute_batched but uploads into g_buf_shared.
+// (Distinct buffer so routed-expert work across calls isn't thrashed by shared.)
+bool flash_expert_metal_compute_shared_batched(
+        const void * shared_data,
+        int64_t gate_offset, int64_t gate_bytes, enum ggml_type gate_type,
+        int64_t up_offset,   int64_t up_bytes,   enum ggml_type up_type,
+        int64_t down_offset, int64_t down_bytes, enum ggml_type down_type,
+        const float * X,
+        float       * Y,
+        int64_t batch,
+        int64_t n_embd,
+        int64_t n_ff) {
+
+    if (!g_initialized || batch <= 0) return false;
+    (void)gate_bytes; (void)up_bytes;
+
+    @autoreleasepool {
+        ensure_batch_buffers(batch, n_embd, n_ff);
+
+        int64_t total = down_offset + down_bytes;
+        memcpy([g_buf_shared  contents], shared_data, total);
+        memcpy([g_buf_x_batch contents], X, (size_t)batch * n_embd * sizeof(float));
+
+        uint32_t gate_tid = ggml_type_to_shader_id(gate_type);
+        uint32_t up_tid   = ggml_type_to_shader_id(up_type);
+        uint32_t down_tid = ggml_type_to_shader_id(down_type);
+
+        id<MTLCommandQueue> active_queue = g_ggml_queue ? g_ggml_queue : g_queue;
+        id<MTLCommandBuffer> cmd = [active_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        // GATE = W_gate @ X
+        {
+            uint32_t params[4] = { (uint32_t)n_ff, (uint32_t)n_embd, gate_tid, (uint32_t)batch };
+            [enc setComputePipelineState:g_matmul_pipeline];
+            [enc setBuffer:g_buf_shared    offset:gate_offset atIndex:0];
+            [enc setBuffer:g_buf_x_batch   offset:0           atIndex:1];
+            [enc setBuffer:g_buf_gate_batch offset:0          atIndex:2];
+            [enc setBytes:params length:sizeof(params)        atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(n_ff, batch, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+        // UP = W_up @ X
+        {
+            uint32_t params[4] = { (uint32_t)n_ff, (uint32_t)n_embd, up_tid, (uint32_t)batch };
+            [enc setComputePipelineState:g_matmul_pipeline];
+            [enc setBuffer:g_buf_shared offset:up_offset atIndex:0];
+            [enc setBuffer:g_buf_x_batch offset:0        atIndex:1];
+            [enc setBuffer:g_buf_up_batch offset:0       atIndex:2];
+            [enc setBytes:params length:sizeof(params)   atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(n_ff, batch, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+        // SwiGLU
+        {
+            uint32_t total_elems = (uint32_t)(batch * n_ff);
+            uint32_t params[1] = { total_elems };
+            [enc setComputePipelineState:g_swiglu_batch_pipeline];
+            [enc setBuffer:g_buf_gate_batch offset:0 atIndex:0];
+            [enc setBuffer:g_buf_up_batch   offset:0 atIndex:1];
+            [enc setBytes:params length:sizeof(params) atIndex:2];
+            NSUInteger tpg = g_swiglu_batch_pipeline.maxTotalThreadsPerThreadgroup;
+            if (tpg > 256) tpg = 256;
+            [enc dispatchThreads:MTLSizeMake(total_elems, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        }
+        // Y = W_down @ GATE
+        {
+            uint32_t params[4] = { (uint32_t)n_embd, (uint32_t)n_ff, down_tid, (uint32_t)batch };
+            [enc setComputePipelineState:g_matmul_pipeline];
+            [enc setBuffer:g_buf_shared    offset:down_offset atIndex:0];
+            [enc setBuffer:g_buf_gate_batch offset:0          atIndex:1];
+            [enc setBuffer:g_buf_y_batch   offset:0           atIndex:2];
+            [enc setBytes:params length:sizeof(params)        atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(n_embd, batch, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        memcpy(Y, [g_buf_y_batch contents], (size_t)batch * n_embd * sizeof(float));
+    }
+    return true;
+}
+
 void flash_expert_metal_free() {
     g_buf_expert   = nil;
     g_buf_shared   = nil;
@@ -663,6 +875,13 @@ void flash_expert_metal_free() {
     g_matvec_pipeline       = nil;
     g_swiglu_pipeline       = nil;
     g_weighted_add_pipeline = nil;
+    g_matmul_pipeline       = nil;
+    g_swiglu_batch_pipeline = nil;
+    g_buf_x_batch    = nil;
+    g_buf_gate_batch = nil;
+    g_buf_up_batch   = nil;
+    g_buf_y_batch    = nil;
+    g_batch_cap = 0; g_batch_n_embd = 0; g_batch_n_ff = 0;
     g_queue  = nil;
     g_device = nil;
     g_initialized = false;
